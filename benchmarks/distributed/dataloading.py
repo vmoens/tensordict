@@ -44,6 +44,10 @@ parser.add_argument(
     default=2,
 )
 parser.add_argument(
+    "--single_gpu",
+    action="store_true",
+)
+parser.add_argument(
     "--wandb_entity",
     type=str,
     default="",
@@ -56,9 +60,9 @@ parser.add_argument(
 torch.cuda.set_device(0)
 
 RETRY_LIMIT = 2
-NUM_WORKERS = 64
+NUM_WORKERS = 8
 RETRY_DELAY_SECS = 3
-FRACTION = 1
+FRACTION = 10
 DATA_NODE = "Data"
 TRAINER_NODE = "Trainer"
 BATCH_SIZE = 128
@@ -153,7 +157,7 @@ class InvAffine(nn.Module):
 class RandomHFlip(nn.Module):
     def forward(self, x: torch.Tensor):
         idx = (
-            torch.zeros(*x.shape[:-3], 1, 1, 1, device=x.device, dtype=torch.bool)
+            torch.zeros([*x.shape[:-3], 1, 1, 1], device=x.device, dtype=torch.bool)
             .bernoulli_()
             .expand_as(x)
         )
@@ -169,12 +173,12 @@ class RandomCrop(nn.Module):
     def forward(self, x):
         batch = x.shape[:-3]
         index0 = torch.randint(x.shape[-2] - self.h, (*batch, 1), device=x.device)
-        index0 = index0 + torch.arange(self.h, device=x.device)
+        index0 += torch.arange(self.h, device=x.device)
         index0 = (
             index0.unsqueeze(1).unsqueeze(-1).expand(*batch, 3, self.h, x.shape[-1])
         )
         index1 = torch.randint(x.shape[-1] - self.w, (*batch, 1), device=x.device)
-        index1 = index1 + torch.arange(self.w, device=x.device)
+        index1 += torch.arange(self.w, device=x.device)
         index1 = index1.unsqueeze(1).unsqueeze(-2).expand(*batch, 3, self.h, self.w)
         return x.gather(-2, index0).gather(-1, index1)
 
@@ -185,17 +189,14 @@ class Collate(nn.Module):
         self.transform = transform
         self.device = device
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(self, x: ImageNetData):
-        # move data to RAM
-        out = x.apply(lambda _tensor: _tensor.contiguous().pin_memory())
-        if self.device:
-            # move data to gpu
-            out = out.to(self.device)
+        # move data to cuda: we first assign the devie to the memmap tensors,
+        # then call contiguous() to effectively move them to the right device
+        out = x.apply(lambda _tensor: _tensor.to(self.device).contiguous())
         if self.transform:
             # apply transforms on gpu
-            for t in self.transform:
-                out.images = t(out.images)
+            out.images = self.transform(out.images)
         return out
 
 
@@ -208,10 +209,11 @@ class Collate(nn.Module):
 
 @accept_remote_rref_udf_invocation
 class DummyTrainerNode:
-    def __init__(self, world_size: int) -> None:
+    def __init__(self, world_size: int, single_gpu: bool) -> None:
         self.id = rpc.get_worker_info().id
         self.datanodes = []
         self.world_size = world_size
+        self.single_gpu = single_gpu
 
     def init(self, train_data_tc):
         self.data = train_data_tc
@@ -270,7 +272,9 @@ class DummyTrainerNode:
     def create_data(self, node) -> rpc.RRef:
         print(f"Creating DataNode object on remote node {node}")
         data_info = rpc.get_worker_info(f"{DATA_NODE}_{node}")
-        data_rref = rpc.remote(data_info, DataNode, args=(node, BATCH_SIZE))
+        data_rref = rpc.remote(
+            data_info, DataNode, args=(node, BATCH_SIZE, self.single_gpu)
+        )
         print(f"Connected to data node {data_info}")
         time.sleep(5)
         self.datanodes.append(data_rref)
@@ -288,23 +292,27 @@ class DummyTrainerNode:
 
 @accept_remote_rref_udf_invocation
 class DataNode:
-    def __init__(self, rank, batch_size: int = BATCH_SIZE):
+    def __init__(self, rank, batch_size: int = BATCH_SIZE, single_gpu: bool = False):
         print("Creating DataNode object")
         self.rank = rank
         self.id = rpc.get_worker_info().id
+        self.single_gpu = single_gpu
         train_ref = rpc.get_worker_info(f"{TRAINER_NODE}")
         self.train_ref = rpc.remote(
             train_ref,
             get_trainer,
         )
         self.batch_size = batch_size
-        device = f"cuda:{rank}"
+        if self.single_gpu:
+            device = "cuda:1"
+        else:
+            device = f"cuda:{rank}"
+        loc = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1) * 255
+        scale = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1) * 255
         self.collate_transform = nn.Sequential(
             InvAffine(
-                loc=torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-                * 255,
-                scale=torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
-                * 255,
+                loc=loc,
+                scale=scale,
             ),
             RandomCrop(224, 224),
             RandomHFlip(),
@@ -327,8 +335,7 @@ class DataNode:
         if not self.initialized:
             self._init()
         self.count += 1
-        out = self.collate(self.data[idx])
-        return out
+        return self.collate(self.data[idx])
 
 
 global trainer
@@ -373,13 +380,13 @@ def shutdown():
     rpc.shutdown()
 
 
-def func(rank, world_size, args, train_data_tc):
+def func(rank, world_size, args, train_data_tc, single_gpu):
     global trainer
     # access GPU
     torch.randn(1, device="cuda:0")
     if rank == 0:
 
-        trainer = DummyTrainerNode(world_size)
+        trainer = DummyTrainerNode(world_size, single_gpu)
         for dest_rank in range(1, world_size):
             trainer.create_data(dest_rank)
         trainer.init(train_data_tc)
@@ -417,6 +424,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     world_size = args.world_size
+    single_gpu = args.single_gpu
 
     names = [TRAINER_NODE, *[f"{DATA_NODE}_{rank}" for rank in range(1, world_size)]]
 
@@ -439,7 +447,7 @@ if __name__ == "__main__":
         pool.starmap(
             func,
             (
-                (rank, world_size, args, train_data_tc)
+                (rank, world_size, args, train_data_tc, single_gpu)
                 for rank, name in enumerate(names)
             ),
         )
