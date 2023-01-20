@@ -46,6 +46,13 @@ parser.add_argument(
 parser.add_argument(
     "--single_gpu",
     action="store_true",
+    help="if True, a single GPU is used for all the data collection nodes.",
+)
+parser.add_argument(
+    "--trainer_transform",
+    action="store_true",
+    help="if True, the transforms are applied on the trainer node. "
+    "Otherwise, they are done by the workers on the assigned GPU.",
 )
 parser.add_argument(
     "--wandb_entity",
@@ -62,7 +69,7 @@ torch.cuda.set_device(0)
 RETRY_LIMIT = 2
 NUM_WORKERS = 8
 RETRY_DELAY_SECS = 3
-FRACTION = 10
+FRACTION = 1
 DATA_NODE = "Data"
 TRAINER_NODE = "Trainer"
 BATCH_SIZE = 128
@@ -173,12 +180,12 @@ class RandomCrop(nn.Module):
     def forward(self, x):
         batch = x.shape[:-3]
         index0 = torch.randint(x.shape[-2] - self.h, (*batch, 1), device=x.device)
-        index0 += torch.arange(self.h, device=x.device)
+        index0 = index0 + torch.arange(self.h, device=x.device)
         index0 = (
             index0.unsqueeze(1).unsqueeze(-1).expand(*batch, 3, self.h, x.shape[-1])
         )
         index1 = torch.randint(x.shape[-1] - self.w, (*batch, 1), device=x.device)
-        index1 += torch.arange(self.w, device=x.device)
+        index1 = index1 + torch.arange(self.w, device=x.device)
         index1 = index1.unsqueeze(1).unsqueeze(-2).expand(*batch, 3, self.h, self.w)
         return x.gather(-2, index0).gather(-1, index1)
 
@@ -209,11 +216,29 @@ class Collate(nn.Module):
 
 @accept_remote_rref_udf_invocation
 class DummyTrainerNode:
-    def __init__(self, world_size: int, single_gpu: bool) -> None:
+    def __init__(
+        self, world_size: int, single_gpu: bool, local_transform: bool = True
+    ) -> None:
         self.id = rpc.get_worker_info().id
         self.datanodes = []
         self.world_size = world_size
         self.single_gpu = single_gpu
+        self.local_transform = local_transform
+        if not local_transform:
+            loc = (
+                torch.tensor([0.485, 0.456, 0.406], device="cuda:0").view(3, 1, 1) * 255
+            )
+            scale = (
+                torch.tensor([0.229, 0.224, 0.225], device="cuda:0").view(3, 1, 1) * 255
+            )
+            self.collate_transform = nn.Sequential(
+                InvAffine(
+                    loc=loc,
+                    scale=scale,
+                ),
+                RandomCrop(224, 224),
+                RandomHFlip(),
+            )
 
     def init(self, train_data_tc):
         self.data = train_data_tc
@@ -241,6 +266,9 @@ class DummyTrainerNode:
         iteration = 0
         while len(_prefetch_queue):
             batch = _prefetch_queue.popleft().wait()
+            if not self.local_transform:
+                batch.images = self.collate_transform(batch.images)
+
             i = iteration % (self.world_size - 1)
             iteration += 1
             if iteration == self.world_size:
@@ -269,11 +297,13 @@ class DummyTrainerNode:
         wait=tenacity.wait_fixed(RETRY_DELAY_SECS),
         reraise=True,
     )
-    def create_data(self, node) -> rpc.RRef:
+    def create_data_node(self, node, local_transform) -> rpc.RRef:
         print(f"Creating DataNode object on remote node {node}")
         data_info = rpc.get_worker_info(f"{DATA_NODE}_{node}")
         data_rref = rpc.remote(
-            data_info, DataNode, args=(node, BATCH_SIZE, self.single_gpu)
+            data_info,
+            DataNode,
+            args=(node, BATCH_SIZE, self.single_gpu, local_transform),
         )
         print(f"Connected to data node {data_info}")
         time.sleep(5)
@@ -292,7 +322,13 @@ class DummyTrainerNode:
 
 @accept_remote_rref_udf_invocation
 class DataNode:
-    def __init__(self, rank, batch_size: int = BATCH_SIZE, single_gpu: bool = False):
+    def __init__(
+        self,
+        rank,
+        batch_size: int = BATCH_SIZE,
+        single_gpu: bool = False,
+        make_transform: bool = True,
+    ):
         print("Creating DataNode object")
         self.rank = rank
         self.id = rpc.get_worker_info().id
@@ -307,16 +343,22 @@ class DataNode:
             device = "cuda:1"
         else:
             device = f"cuda:{rank}"
-        loc = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1) * 255
-        scale = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1) * 255
-        self.collate_transform = nn.Sequential(
-            InvAffine(
-                loc=loc,
-                scale=scale,
-            ),
-            RandomCrop(224, 224),
-            RandomHFlip(),
-        )
+        self.make_transform = make_transform
+        if self.make_transform:
+            loc = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1) * 255
+            scale = (
+                torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1) * 255
+            )
+            self.collate_transform = nn.Sequential(
+                InvAffine(
+                    loc=loc,
+                    scale=scale,
+                ),
+                RandomCrop(224, 224),
+                RandomHFlip(),
+            )
+        else:
+            self.collate_transform = None
         self.collate = Collate(self.collate_transform, device=device)
         self.initialized = False
         self.count = 0
@@ -350,7 +392,12 @@ def get_trainer():
 #
 
 
-def init_rpc(rank, name, world_size):
+def init_rpc(
+    rank,
+    name,
+    world_size,
+    single_gpu,
+):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
     os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
@@ -364,7 +411,9 @@ def init_rpc(rank, name, world_size):
     if rank == 0:
         # All data must be sent to cuda:0
         for dest_rank in range(1, world_size):
-            options.set_device_map(f"{DATA_NODE}_{dest_rank}", {0: dest_rank})
+            options.set_device_map(
+                f"{DATA_NODE}_{dest_rank}", {0: dest_rank if not single_gpu else 1}
+            )
 
     rpc.init_rpc(
         name,
@@ -380,26 +429,28 @@ def shutdown():
     rpc.shutdown()
 
 
-def func(rank, world_size, args, train_data_tc, single_gpu):
+def func(rank, world_size, args, train_data_tc, single_gpu, trainer_transform):
     global trainer
     # access GPU
     torch.randn(1, device="cuda:0")
     if rank == 0:
 
-        trainer = DummyTrainerNode(world_size, single_gpu)
+        trainer = DummyTrainerNode(
+            world_size, single_gpu, local_transform=not trainer_transform
+        )
         for dest_rank in range(1, world_size):
-            trainer.create_data(dest_rank)
+            trainer.create_data_node(dest_rank, local_transform=not trainer_transform)
         trainer.init(train_data_tc)
         import wandb
 
         if not args.wandb_key:
             print("no wandb key provided, using it offline")
             mode = "offline"
-            if not args.wandb_entity:
-                raise ValueError("Please indicate the wandb entity.")
         else:
             mode = "online"
             wandb.login(key=str(args.wandb_key))
+            if not args.wandb_entity:
+                raise ValueError("Please indicate the wandb entity.")
         with wandb.init(
             project="dataloading",
             name="distributed",
@@ -413,6 +464,7 @@ def func(rank, world_size, args, train_data_tc, single_gpu):
                     min_time = stats["time"]
                     rate = stats["rate"]
                 wandb.log(stats, step=i)
+            wandb.log({"min time": min_time, "rate": rate}, step=i)
             print(f"FINAL: time spent: {min_time:4.4f}s, Rate: {rate} fps")
 
 
@@ -425,6 +477,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     world_size = args.world_size
     single_gpu = args.single_gpu
+    trainer_transform = args.trainer_transform
 
     names = [TRAINER_NODE, *[f"{DATA_NODE}_{rank}" for rank in range(1, world_size)]]
 
@@ -442,12 +495,21 @@ if __name__ == "__main__":
 
     with mp.Pool(world_size) as pool:
         pool.starmap(
-            init_rpc, ((rank, name, world_size) for rank, name in enumerate(names))
+            init_rpc,
+            (
+                (
+                    rank,
+                    name,
+                    world_size,
+                    single_gpu,
+                )
+                for rank, name in enumerate(names)
+            ),
         )
         pool.starmap(
             func,
             (
-                (rank, world_size, args, train_data_tc, single_gpu)
+                (rank, world_size, args, train_data_tc, single_gpu, trainer_transform)
                 for rank, name in enumerate(names)
             ),
         )
