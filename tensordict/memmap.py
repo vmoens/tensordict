@@ -245,7 +245,7 @@ class MemoryMappedTensor(torch.Tensor):
             if not existsok and os.path.exists(str(filename)):
                 raise RuntimeError(f"The file {filename} already exists.")
             result = torch.from_file(
-                str(filename), shared=True, dtype=input.dtype, size=shape_numel
+                str(filename), shared=True, dtype=input.dtype, size=shape_numel, device="cpu"
             )
             if isinstance(shape, torch.Tensor):
                 func_offset_stride = getattr(

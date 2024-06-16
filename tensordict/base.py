@@ -2572,7 +2572,7 @@ class TensorDictBase(MutableMapping):
                 )
             filesize = sum(flat_size)
             storage = torch.from_file(
-                str(filename), size=filesize, dtype=torch.uint8, shared=True
+                str(filename), size=filesize, dtype=torch.uint8, shared=True, device="cpu"
             )
             assert len(storage.untyped_storage()) == sum(flat_size)
 
