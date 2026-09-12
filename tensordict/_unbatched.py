@@ -61,7 +61,9 @@ class _UnbatchedTensorMixin:
         self._batch_size = torch.Size(batch_size)
 
     def copy(self):
-        out = type(self)(self._base_tensor())
+        # Alias the payload without converting to a plain Tensor, which Dynamo
+        # cannot trace for the __torch_function__ fallback inside vmap.
+        out = torch.ops.aten.alias.default(self)
         batch_size = getattr(self, "_batch_size", None)
         if batch_size is not None:
             out.batch_size = batch_size
