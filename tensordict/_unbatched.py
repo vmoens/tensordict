@@ -8,6 +8,7 @@ import math
 import warnings
 
 import torch
+from torch.overrides import get_default_nowrap_functions
 
 
 def _has_wrapper_subclass_vmap_fix():
@@ -405,6 +406,9 @@ else:
             batch_size = cls._batch_size_from_args(args, kwargs)
             with torch._C.DisableTorchFunctionSubclass():
                 result = func(*args, **kwargs)
+                # Rewrapping a view's base creates an endless chain of views.
+                if func in get_default_nowrap_functions():
+                    return result
                 if isinstance(result, torch.Tensor):
                     out = result.as_subclass(cls)
                     if batch_size is not None:
